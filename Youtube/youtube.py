@@ -7,6 +7,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from Youtube.config import Config
 from Youtube.forcesub import handle_force_subscribe
 from pathlib import Path
+import tempfile
 
 # Configure logging
 logging.basicConfig(
@@ -19,9 +20,17 @@ logger = logging.getLogger(__name__)
 youtube_dl_username = None  
 youtube_dl_password = None
 DOWNLOAD_FOLDER = "yt_downloads"
+COOKIES_FILE = "cookies.txt"
 
 # Ensure download folder exists
 Path(DOWNLOAD_FOLDER).mkdir(exist_ok=True)
+
+def get_cookies_config():
+    """Return cookies configuration if cookies file exists"""
+    if os.path.exists(COOKIES_FILE):
+        logger.info("Using cookies file for authentication")
+        return {'cookiefile': COOKIES_FILE}
+    return {}
 
 @Client.on_message(filters.regex(r'^(http(s)?:\/\/)?((w){3}.)?youtu(be|.be)?(\.com)?\/.+'))
 async def process_youtube_link(client, message):
@@ -59,11 +68,41 @@ async def process_youtube_link(client, message):
 async def cleanup_file(file_path):
     """Safely remove downloaded files"""
     try:
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"Cleaned up file: {file_path}")
     except Exception as e:
         logger.error(f"Error cleaning up file {file_path}: {e}")
+
+async def download_thumbnail(thumbnail_url):
+    """Download thumbnail to temporary file"""
+    if not thumbnail_url:
+        return None
+        
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'outtmpl': os.path.join(tempfile.gettempdir(), 'thumbnail_%(id)s.%(ext)s'),
+            'skip_download': True,
+            'writethumbnail': True,
+            'format': 'best'
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(thumbnail_url, download=False)
+            if not info:
+                return None
+                
+            ydl.download([thumbnail_url])
+            thumb_path = os.path.join(
+                tempfile.gettempdir(),
+                f"thumbnail_{info['id']}.{info['thumbnail'].split('.')[-1]}"
+            )
+            return thumb_path if os.path.exists(thumb_path) else None
+    except Exception as e:
+        logger.error(f"Error downloading thumbnail: {e}")
+        return None
 
 async def get_video_info(ydl, url):
     """Get video information safely"""
@@ -73,16 +112,35 @@ async def get_video_info(ydl, url):
         logger.error(f"Error getting video info: {e}")
         return None
 
-async def download_media(ydl, url):
-    """Download media with error handling"""
+async def get_actual_file_path(download_path, file_id, is_audio=False):
+    """Find the actual downloaded file path"""
     try:
-        return ydl.download([url])
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {e}")
-        raise
+        # First try the expected path
+        expected_ext = 'mp3' if is_audio else 'mp4'
+        expected_path = os.path.join(
+            DOWNLOAD_FOLDER,
+            f"downloaded_{'audio_' if is_audio else ''}{file_id}.{expected_ext}"
+        )
+        
+        if os.path.exists(expected_path):
+            return expected_path
+            
+        # If not found, search for any file with the video ID
+        pattern = f"*{file_id}*"
+        possible_files = list(Path(DOWNLOAD_FOLDER).glob(pattern))
+        
+        if possible_files:
+            return str(possible_files[0])
+            
+        # Also check temp directory
+        temp_files = list(Path(tempfile.gettempdir()).glob(pattern))
+        if temp_files:
+            return str(temp_files[0])
+            
+        return None
     except Exception as e:
-        logger.error(f"Unexpected download error: {e}")
-        raise
+        logger.error(f"Error finding file path: {e}")
+        return None
 
 @Client.on_callback_query(filters.regex(r'^(download|info)\|'))
 async def handle_callback_query(client, callback_query):
@@ -117,10 +175,10 @@ async def handle_callback_query(client, callback_query):
             'format': quality_formats[quality],
             'outtmpl': os.path.join(DOWNLOAD_FOLDER, f'downloaded_%(id)s.%(ext)s'),
             'progress_hooks': [lambda d: logger.info(d.get('status', 'No status'))],
-            'cookiefile': 'cookies.txt',
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
+            **get_cookies_config()
         }
 
         if quality == 'audio':
@@ -147,49 +205,50 @@ async def handle_callback_query(client, callback_query):
                 return
 
             title = info_dict.get('title', 'Untitled')
-            file_ext = 'mp3' if quality == 'audio' else 'mp4'
             file_id = info_dict['id']
-            file_path = os.path.join(
-                DOWNLOAD_FOLDER,
-                f"downloaded_{'audio_' if quality == 'audio' else ''}{file_id}.{file_ext}"
-            )
-
-            # Clean up any existing file
-            await cleanup_file(file_path)
+            is_audio = quality == 'audio'
+            
+            # Clean up any existing files
+            await cleanup_file(os.path.join(DOWNLOAD_FOLDER, f"downloaded_{file_id}*"))
             
             try:
                 await asyncio.to_thread(ydl.download, [youtube_link])
                 
-                if not os.path.exists(file_path):
-                    # Check for alternative file paths
-                    possible_files = list(Path(DOWNLOAD_FOLDER).glob(f"*{file_id}*"))
-                    if possible_files:
-                        file_path = str(possible_files[0])
-                    else:
-                        raise FileNotFoundError("Downloaded file not found")
+                file_path = await get_actual_file_path(DOWNLOAD_FOLDER, file_id, is_audio)
+                if not file_path:
+                    raise FileNotFoundError("Downloaded file not found")
 
                 await downloading_msg.edit("📤 Uploading...")
                 
-                if quality == 'audio':
-                    await client.send_audio(
-                        chat_id=callback_query.message.chat.id,
-                        audio=file_path,
-                        caption=f"🎵 {title}",
-                        title=title[:64],
-                        performer=info_dict.get('uploader', 'Unknown Artist')[:64],
-                        duration=info_dict.get('duration', 0),
-                        thumb=info_dict.get('thumbnail')
-                    )
+                # Handle thumbnail
+                thumb_path = None
+                thumbnail_url = info_dict.get('thumbnail')
+                if thumbnail_url:
+                    thumb_path = await download_thumbnail(thumbnail_url)
+                
+                upload_kwargs = {
+                    'chat_id': callback_query.message.chat.id,
+                    'caption': f"🎵 {title}" if is_audio else f"🎬 {title}",
+                }
+                
+                if is_audio:
+                    upload_kwargs.update({
+                        'audio': file_path,
+                        'title': title[:64],
+                        'performer': info_dict.get('uploader', 'Unknown Artist')[:64],
+                        'duration': info_dict.get('duration', 0),
+                        'thumb': thumb_path
+                    })
+                    await client.send_audio(**upload_kwargs)
                 else:
-                    await client.send_video(
-                        chat_id=callback_query.message.chat.id,
-                        video=file_path,
-                        caption=f"🎬 {title}",
-                        duration=info_dict.get('duration', 0),
-                        width=info_dict.get('width'),
-                        height=info_dict.get('height'),
-                        thumb=info_dict.get('thumbnail')
-                    )
+                    upload_kwargs.update({
+                        'video': file_path,
+                        'duration': info_dict.get('duration', 0),
+                        'width': info_dict.get('width'),
+                        'height': info_dict.get('height'),
+                        'thumb': thumb_path
+                    })
+                    await client.send_video(**upload_kwargs)
                 
                 await downloading_msg.delete()
                 await callback_query.message.reply("✅ Successfully uploaded!")
@@ -199,6 +258,8 @@ async def handle_callback_query(client, callback_query):
                 await callback_query.message.reply(f"❌ Upload failed: {str(upload_error)}")
             finally:
                 await cleanup_file(file_path)
+                if thumb_path:
+                    await cleanup_file(thumb_path)
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
@@ -224,7 +285,8 @@ async def handle_info_request(client, callback_query, youtube_link):
             'quiet': True,
             'no_warnings': True,
             'simulate': True,
-            'extract_flat': False
+            'extract_flat': False,
+            **get_cookies_config()
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -243,12 +305,15 @@ async def handle_info_request(client, callback_query, youtube_link):
                 f"📅 **Upload Date:** {info.get('upload_date', 'Unknown')}"
             )
             
-            thumbnail = info.get('thumbnail')
-            if thumbnail:
+            thumbnail_url = info.get('thumbnail')
+            thumb_path = await download_thumbnail(thumbnail_url) if thumbnail_url else None
+            
+            if thumb_path:
                 await callback_query.message.reply_photo(
-                    photo=thumbnail,
+                    photo=thumb_path,
                     caption=message_text
                 )
+                await cleanup_file(thumb_path)
             else:
                 await callback_query.message.reply(message_text)
                 
